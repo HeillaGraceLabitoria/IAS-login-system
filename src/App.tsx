@@ -188,11 +188,7 @@ export default function App() {
               </form>
             </div>
 
-            <div className="security-footer">
-              <span>🔒 Scrypt + Salt</span>
-              <span>🛡️ Prepared SQL</span>
-              <span>⏱️ 3-Strike Lockout</span>
-            </div>
+      
           </section>
         ) : (
           <section className="dashboard-card">
