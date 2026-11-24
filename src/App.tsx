@@ -187,8 +187,6 @@ export default function App() {
                 )}
               </form>
             </div>
-
-      
           </section>
         ) : (
           <section className="dashboard-card">
