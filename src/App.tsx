@@ -3,8 +3,6 @@
  * Subject: Information Assurance and Security (IAS) — Final Project
  */
 import React, { useState, useEffect } from 'react';
-import './index.css';
-
 interface UserSession {
   id: number;
   username: string;
