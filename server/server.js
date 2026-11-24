@@ -84,7 +84,7 @@ app.post('/api/login', (req, res) => {
       success: false,
       locked: true,
       secondsLeft,
-      message: `Brute-Force Protection: System locked due to wrong usernames. Try again in ${secondsLeft}s.`
+      message: `Warning! System locked due to wrong credentials. Try again in ${secondsLeft}s.`
     });
   }
 
