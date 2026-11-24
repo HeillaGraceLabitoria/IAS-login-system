@@ -13,6 +13,9 @@ const PORT = 5000;
 app.use(cors());
 app.use(express.json());
 
+// Track IP-level failed attempts so wrong usernames also trigger the 3-strike lockout
+const ipAttempts = new Map();
+
 // 1. Initialize Local SQLite Database
 const db = new DatabaseSync('./ias_security.sqlite');
 
@@ -66,9 +69,23 @@ const insertLog = db.prepare(`
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
   const clientIp = req.ip || '127.0.0.1';
+  const now = Date.now();
 
   if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
     return res.status(400).json({ success: false, message: 'Invalid input format.' });
+  }
+
+  // Check IP-level lockout first (covers 3 wrong username attempts)
+  const ipState = ipAttempts.get(clientIp) || { count: 0, lockedUntil: 0 };
+  if (ipState.lockedUntil > now) {
+    const secondsLeft = Math.ceil((ipState.lockedUntil - now) / 1000);
+    insertLog.run(username, 'LOCKED', `Blocked during ${secondsLeft}s IP lockout window`, clientIp);
+    return res.status(429).json({
+      success: false,
+      locked: true,
+      secondsLeft,
+      message: `Brute-Force Protection: System locked due to wrong usernames. Try again in ${secondsLeft}s.`
+    });
   }
 
   const isAttackPayload = /('|--|;|<script>|OR\s+1=1)/i.test(username);
@@ -76,16 +93,33 @@ app.post('/api/login', (req, res) => {
   // Parameterized query prevents SQL Injection
   const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username.trim());
 
+  // CASE A: Wrong Username
   if (!user) {
+    const newIpCount = ipState.count + 1;
     const note = isAttackPayload
       ? 'SQLi/XSS payload neutralized by parameterized query'
-      : 'Unknown username rejected';
+      : `Wrong username rejected (Attempt ${newIpCount}/3)`;
+
+    if (newIpCount >= 3) {
+      ipAttempts.set(clientIp, { count: 0, lockedUntil: now + 30 * 1000 });
+      insertLog.run(username, 'LOCKED', '3 wrong username attempts — Locked for 30s', clientIp);
+      return res.status(429).json({
+        success: false,
+        locked: true,
+        secondsLeft: 30,
+        message: 'Wrong username (Attempt 3 of 3). Locked for 30s.'
+      });
+    }
+
+    ipAttempts.set(clientIp, { count: newIpCount, lockedUntil: 0 });
     insertLog.run(username, 'FAILED', note, clientIp);
-    return res.status(401).json({ success: false, message: 'Invalid username or password.' });
+    return res.status(401).json({
+      success: false,
+      message: `Wrong username: "${username.trim()}" is not registered. (Attempt ${newIpCount} of 3)`
+    });
   }
 
-  // Brute-Force Lockout Check
-  const now = Date.now();
+  // Account-level Brute-Force Lockout Check (covers 3 wrong password attempts)
   if (user.locked_until && user.locked_until > now) {
     const secondsLeft = Math.ceil((user.locked_until - now) / 1000);
     insertLog.run(username, 'LOCKED', `Blocked during ${secondsLeft}s lockout window`, clientIp);
@@ -93,25 +127,33 @@ app.post('/api/login', (req, res) => {
       success: false,
       locked: true,
       secondsLeft,
-      message: `Account locked due to multiple failed attempts. Try again in ${secondsLeft}s.`
+      message: `Account locked due to wrong passwords. Try again in ${secondsLeft}s.`
     });
+  }
+
+  // Clear any expired lockout state from SQLite before counting a new cycle
+  let currentFailedAttempts = user.failed_attempts;
+  if (user.locked_until && user.locked_until <= now) {
+    currentFailedAttempts = 0;
+    db.prepare('UPDATE users SET failed_attempts = 0, locked_until = 0 WHERE id = ?').run(user.id);
   }
 
   const isValid = verifyPassword(password, user.salt, user.password_hash);
 
+  // CASE B: Valid Username, Wrong Password
   if (!isValid) {
-    const newAttempts = user.failed_attempts + 1;
+    const newAttempts = currentFailedAttempts + 1;
     if (newAttempts >= 3) {
       const lockUntil = now + 30 * 1000;
-      db.prepare('UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?')
-        .run(newAttempts, lockUntil, user.id);
-      insertLog.run(username, 'LOCKED', '3 failed attempts — Account locked for 30s', clientIp);
+      db.prepare('UPDATE users SET failed_attempts = 0, locked_until = ? WHERE id = ?')
+        .run(lockUntil, user.id);
+      insertLog.run(username, 'LOCKED', '3 wrong password attempts — Account locked for 30s', clientIp);
 
       return res.status(429).json({
         success: false,
         locked: true,
         secondsLeft: 30,
-        message: 'Brute-Force Protection: 3 failed attempts. Account locked for 30s.'
+        message: 'Wrong password (Attempt 3 of 3). Account locked for 30s.'
       });
     } else {
       db.prepare('UPDATE users SET failed_attempts = ? WHERE id = ?').run(newAttempts, user.id);
@@ -119,7 +161,7 @@ app.post('/api/login', (req, res) => {
 
       return res.status(401).json({
         success: false,
-        message: `Invalid credentials. Attempt ${newAttempts} of 3.`
+        message: `Wrong password for "${user.username}". (Attempt ${newAttempts} of 3)`
       });
     }
   }
@@ -130,7 +172,10 @@ app.post('/api/login', (req, res) => {
     ? 'Authenticated (IAS Policy Notice: Default/Weak password detected — recommend rotation)'
     : 'Authenticated via scrypt salted hash';
 
+  // Clear both IP and account failed counters on valid login
+  ipAttempts.delete(clientIp);
   db.prepare('UPDATE users SET failed_attempts = 0, locked_until = 0 WHERE id = ?').run(user.id);
+
   const sessionToken = crypto.randomBytes(24).toString('hex');
   insertLog.run(username, 'SUCCESS', loginNote, clientIp);
 
